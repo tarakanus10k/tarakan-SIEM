@@ -1,0 +1,8 @@
+# DEFAULT LOGS LIST
+# CHANGE PATH TO LOGS DEPENDING ON DISTRO
+
+logs:
+  - name: syslog
+    path: /var/log/syslog
+  - name: authlog
+    path: /var/log/auth.log
