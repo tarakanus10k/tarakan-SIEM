@@ -4,5 +4,6 @@
 logs:
   - name: syslog
     path: /var/log/syslog
+
   - name: authlog
     path: /var/log/auth.log
