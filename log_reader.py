@@ -1,4 +1,0 @@
-# FILE FOR READING LOG FILES
-
-from config import LOGCONFIG
-
