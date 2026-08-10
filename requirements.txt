@@ -1,1 +1,2 @@
 PyYAML>=6.0.3
+ocsf_schema_compiler>=1.1.1
