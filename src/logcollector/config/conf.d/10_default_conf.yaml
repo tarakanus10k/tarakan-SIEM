@@ -1,0 +1,8 @@
+logs:
+  - type: file
+    name: syslog
+    path: /var/log/syslog
+
+  - type: file
+    name: authlog
+    path: /var/log/auth.log
