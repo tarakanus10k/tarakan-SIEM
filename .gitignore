@@ -1,5 +1,8 @@
-# agent-logic FILE
+# agent-logic file
 agent-logic.md
+
+# docs dir
+docs
 
 # logs-files
 *.log
@@ -10,3 +13,6 @@ agent-logic.md
 # venv/.venv
 .venv
 venv
+
+# __pycache__
+__pycache__
