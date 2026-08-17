@@ -1,7 +1,9 @@
+import os
+import glob
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
-import xml.etree.ElementTree as ET
 
 def get_dir_path():
     tree = ET.parse("src/logcollector/config/agent.conf")
@@ -18,6 +20,9 @@ def get_retry_interval():
     value = root.findtext("agent/default_retry_interval")
     
     return float(value.strip())
+
+def _is_glob(location: str) -> bool:
+    return any(char in location for char in "*?")
 
 @dataclass
 class LogFormat:
@@ -52,6 +57,16 @@ class LocalFile:
     location: str
     filter: Optional[JournaldFilter] = None
     multiline: Optional[Multiline] = None
+
+    def dedup_key(self) -> tuple:
+
+        f = (self.filter.field, self.filter.pattern) if self.filter else None
+
+        m = None
+        if self.multiline:
+            m = (self.multiline.type.value, self.multiline.pattern, self.multiline.lines)
+
+        return (self.log_format.value, self.location, f, m)
 
 def parse_filter(localfile_node: ET.Element, log_format: LogFormat) -> Optional[JournaldFilter]:
 
@@ -98,3 +113,101 @@ def parse_multiline(localfile_node: ET.Element, log_format: LogFormat) -> Option
         if n < 1:
             return None
         return Multiline(type=multiline_type_attr, lines=n)
+
+def delete_dupl(unvalid_conf: list[LocalFile]) -> list[LocalFile]:
+
+    unique_item_list: list[LocalFile] = []
+    unique_item_key: set[tuple] = set()
+
+    for list_item in unvalid_conf:
+        key = list_item.dedup_key()
+
+        if key in unique_item_key:
+            continue
+
+        unique_item_key.add(key)
+        unique_item_list.append(list_item)
+
+    return unique_item_list
+
+def open_glob_mask(unique_item_list: list[LocalFile]) -> list[LocalFile]:
+
+    list_with_glob: list[LocalFile] = []
+
+    for list_item in unique_item_list:
+
+        list_item.location = os.path.expanduser(list_item.location)
+        list_item.location = os.path.expandvars(list_item.location)
+
+        if not _is_glob(list_item.location):
+            list_with_glob.append(list_item)
+            continue
+
+        matches = glob.glob(list_item.location, recursive=True)
+
+        for m in sorted(matches):
+            m_path = Path(m)
+
+            if m_path.is_file():
+                list_with_glob.append(
+                    LocalFile(
+                        log_format=list_item.log_format,
+                        location=m_path,
+                        filter=list_item.filter,
+                        multiline=list_item.multiline
+                        )
+                    )
+
+    return list_with_glob
+    
+def validate_journald_log(
+        unique_item_list: list[LocalFile], 
+        valid_conf: list[LocalFile]
+        ) -> list[LocalFile]:
+
+    for list_item in unique_item_list:
+
+        if list_item.log_format == LogFormat.JOURNALD:
+            if list_item.location is None:
+                continue
+
+            if hasattr(os, "geteuid") and os.geteuid():
+                valid_conf.append(list_item)
+
+            try:
+                from systemd import journal
+            except ImportError:
+                pass
+
+            try:
+                with journal.Reader() as reader:
+                    reader.seek_head()
+                valid_conf.append(list_item)
+            except Exception:
+                pass
+
+    return valid_conf
+
+def validate_syslog_json_log(
+        unique_item_list: list[LocalFile], 
+        valid_conf: list[LocalFile]
+        ) -> list[LocalFile]:
+
+    for list_item in unique_item_list:
+
+        if list_item.log_format == LogFormat.SYSLOG or list_item.log_format == LogFormat.JSON:
+            if list_item.location is None:
+                continue
+
+            if hasattr(os, "geteuid") and os.geteuid():
+                valid_conf.append(list_item)
+
+            location = Path(list_item.location)
+
+            if not os.path.exists(location):
+                continue
+
+            if os.access(location, os.R_OK):
+                valid_conf.append(list_item)
+
+    return valid_conf
