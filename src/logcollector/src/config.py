@@ -1,7 +1,7 @@
 import os
 import fnmatch
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import threading
@@ -21,6 +21,9 @@ from ..include.config import (
     get_scan_interval, 
 
     is_text,
+
+    parse_filter,
+    parse_multiline,
 
     open_glob_mask,
     source_key_from_obj,
@@ -61,7 +64,7 @@ class AgentLogConfig:
 
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
-        self._threads = list[threading.Thread] = []
+        self._threads: list[threading.Thread] = []
 
     # ------------------------------------------------------------------
     # public
@@ -79,7 +82,7 @@ class AgentLogConfig:
 
     def get_unvalid_confs(self) -> list[LocalFileRaw]:
         with self._lock:
-            return list[self._unvalid_confs.values()]
+            return list(self._unvalid_confs.values())
 
     def start(self) -> None:
 
@@ -161,7 +164,7 @@ class AgentLogConfig:
         for source_key in self._valid_localfile_confs.pop(localfile_key, set()):
             self._valid_confs.pop(source_key, None)
 
-        self._unvalid_confs(localfile_key, None)
+        self._unvalid_confs.pop(localfile_key, None)
 
     def _parse_conf_file(self, conf_path: str) -> list[LocalFileRaw]:
 
@@ -169,14 +172,14 @@ class AgentLogConfig:
             tree = ET.parse(conf_path)
         except ET.ParseError as e:
             print(f"parse error: {e}")
-            raise
+            return []
 
         root = tree.getroot()
         localfiles: list[LocalFileRaw] = []
 
         for localfile_node in root.findall("localfile"):
 
-            localfile = self._parse_localfile(localfile_node)
+            localfile = self._parse_localfile(localfile_node, conf_location=conf_path)
 
             if localfile is not None:
                 localfiles.append(localfile)
@@ -190,7 +193,7 @@ class AgentLogConfig:
             return None
 
         try:
-            log_format = LocalFileRaw(log_format_raw)
+            log_format = LogFormat(log_format_raw)
         except ValueError:
             return None
 
@@ -198,9 +201,8 @@ class AgentLogConfig:
         if not location_raw:
             return None
 
-        journal_filter = self.parse_filter(localfile_node, log_format)
-
-        multiline = self.parse_multiline(localfile_node, log_format)
+        journal_filter = parse_filter(localfile_node, log_format, conf_location)
+        multiline = parse_multiline(localfile_node, log_format, conf_location)
 
         return(LocalFileRaw(
             log_format=log_format,
@@ -252,7 +254,7 @@ class AgentLogConfig:
 
             source = LocalFile(
                 log_format=localfile.log_format,
-                location=localfile.location,
+                location=real_path,
                 filter=localfile.filter,
                 multiline=localfile.multiline,
                 conf_location=localfile.conf_location
@@ -261,7 +263,7 @@ class AgentLogConfig:
             self._add_source(localfile_key, source)
 
             if any_failed:
-                self._unvalid_confs(localfile_key) = localfile
+                self._unvalid_confs[localfile_key] = localfile
             else:
                 self._unvalid_confs.pop(localfile_key, None)
 
@@ -321,7 +323,7 @@ class AgentLogConfig:
 
                 self._validate_unvalid_confs()
 
-    def _conf_changing(self) -> None:
+    def _conf_changing(self, fpath: str) -> None:
         with self._lock:
             self._load_conf_dir()
             self._validate_unvalid_confs()
@@ -332,7 +334,7 @@ class _Watcher:
             self, 
             conf_dir_path: Path, 
             pattern: str, 
-            callback: callable[[str], None]
+            callback: Callable[[str], None]
             ) -> None:
 
         self.conf_dir_path = conf_dir_path
@@ -366,7 +368,7 @@ class _InotifyWatcher(_Watcher):
         self._mask = IN_MODIFY | IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO
         self._inotify = inotify.adapters.Inotify()
 
-        self._inotify.add_watch(str(self.conf_dir_path))
+        self._inotify.add_watch(str(self.conf_dir_path), mask=self._mask)
 
         super().start()
 
