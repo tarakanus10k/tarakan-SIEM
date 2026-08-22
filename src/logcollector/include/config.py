@@ -100,8 +100,8 @@ def parse_filter(
     if log_format != LogFormat.JOURNALD:
         return None
 
-    field_type_attr = (filter_node.get("field")).strip()
-    field_type_pattern = (filter_node.text).strip()
+    field_type_attr = (filter_node.get("field") or "").strip()
+    field_type_pattern = (filter_node.text or "").strip()
 
     if not field_type_attr or not field_type_pattern:
         return None
@@ -126,8 +126,8 @@ def parse_multiline(
     if log_format == LogFormat.JSON:
         return None
 
-    multiline_type_raw = (multiline_node.get("type")).strip()
-    multiline_type_value = (multiline_node.text).strip()
+    multiline_type_raw = (multiline_node.get("type") or "").strip()
+    multiline_type_value = (multiline_node.text or "").strip()
 
     try:
         multiline_type = MultilineType(multiline_type_raw)
