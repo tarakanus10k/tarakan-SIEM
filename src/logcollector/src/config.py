@@ -133,7 +133,7 @@ class AgentLogConfig:
 
         self._conf_mtimes = current_mtimes
 
-        all_localfiles = dict[tuple, LocalFileRaw] = {}
+        all_localfiles: dict[tuple, LocalFileRaw] = {}
 
         for conf_file in current_mtimes:
             parsed_cf = self._parse_conf_file(conf_file)
@@ -188,7 +188,7 @@ class AgentLogConfig:
 
     def _parse_localfile(self, localfile_node: ET.Element, conf_location: str) -> Optional[LocalFileRaw]:
 
-        log_format_raw = is_text(localfile_node.find("log_format").text)
+        log_format_raw = is_text(localfile_node.find("log_format"))
         if not log_format_raw:
             return None
 
@@ -197,7 +197,7 @@ class AgentLogConfig:
         except ValueError:
             return None
 
-        location_raw = is_text(localfile_node.find("location").text)
+        location_raw = is_text(localfile_node.find("location"))
         if not location_raw:
             return None
 
@@ -262,10 +262,10 @@ class AgentLogConfig:
 
             self._add_source(localfile_key, source)
 
-            if any_failed:
-                self._unvalid_confs[localfile_key] = localfile
-            else:
-                self._unvalid_confs.pop(localfile_key, None)
+        if any_failed:
+            self._unvalid_confs[localfile_key] = localfile
+        else:
+            self._unvalid_confs.pop(localfile_key, None)
 
     def _add_source(self, localfile_key: tuple, source: LocalFile) -> None:
 
@@ -316,7 +316,7 @@ class AgentLogConfig:
 
     def _retry_loop(self) -> None:
 
-        while not self._stop_event.wait(self.conf_scan_interval):
+        while not self._stop_event.wait(self.conf_retry_interval):
             with self._lock:
                 if not self._unvalid_confs:
                     continue
