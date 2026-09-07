@@ -1,5 +1,6 @@
 import socket
 import platform
+import time
 import xml.etree.ElementTree as ET
 
 def get_default_state_flush_interval():
@@ -46,3 +47,6 @@ def get_host_ip():
 
 def get_os_info():
     return str(f"{platform.system()} {platform.release()}".strip())
+
+def utc_now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

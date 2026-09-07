@@ -17,12 +17,6 @@ def get_file_inode(path: str) -> Optional[int]:
     except OSError:
         return None
 
-def get_file_size(path: str) -> Optional[int]:
-    try:
-        return os.stat(path).st_size
-    except OSError:
-        return None
-
 def find_rotated_file(
         old_inode: int, 
         hint_dir: str, 
@@ -46,3 +40,9 @@ def find_rotated_file(
             return full
 
     return None
+
+def get_file_size(path: str) -> Optional[int]:
+    try:
+        return os.stat(path).st_size
+    except OSError:
+        return None
