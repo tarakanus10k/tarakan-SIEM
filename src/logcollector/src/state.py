@@ -153,7 +153,7 @@ class StateStore:
         path = self._state_file(source_key)
 
         try:
-            path.uplink(missing_ok=True)
+            path.unlink(missing_ok=True)
         except OSError as e:
             print("can't delete state")
 
