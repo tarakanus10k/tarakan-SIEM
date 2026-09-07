@@ -16,7 +16,7 @@ def find_object_end(text: str, start: int) -> int:
                 escape = False
 
             elif ch == "\\":
-                escape == True
+                escape = True
 
             elif ch == '"':
                 in_string = False
@@ -31,7 +31,7 @@ def find_object_end(text: str, start: int) -> int:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return 1
+                    return i
 
         i += 1
 
