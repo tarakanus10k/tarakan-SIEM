@@ -100,7 +100,7 @@ class DiskQueue:
                 return None
 
             try:
-                path.uplink()
+                path.unlink()
             except OSError as e:
                 print("can't delete the queue-element")
 
@@ -148,7 +148,7 @@ class DiskQueue:
         with self._lock:
             for p in self._dir.glob("item-*.bin"):
                 try:
-                    p.uplink()
+                    p.unlink()
                 except OSError:
                     pass
 
@@ -169,7 +169,7 @@ class DiskQueue:
             raise RuntimeError
 
     def _item_path(self, seq: int) -> Path:
-        return self._dir / self.META_FILE
+        return self._dir / f"item-{seq:020d}.bin"
 
     def _meta_path(self) -> Path:
         return self._dir / self.META_FILE
