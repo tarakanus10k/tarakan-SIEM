@@ -243,7 +243,7 @@ class LogCollector:
 
             if ml.type == _config.MultilineType.REGEX:
                 return MultilineRegexReader(
-                    pattern=ml.pettern or "", encoding=self._cfg.encoding
+                    pattern=ml.pattern or "", encoding=self._cfg.encoding
                 )
 
             if ml.type == _config.MultilineType.UNIT:
@@ -383,7 +383,7 @@ class LogCollector:
                 if self._stop_event.is_set():
                     break
 
-                self._poll_source(fs)
+                self._poll_sources(fs)
             self._stop_event.wait(self._cfg.default_selector_timeout)
 
     def _poll_sources(self, fs: _FileSource) -> None:
@@ -437,7 +437,7 @@ class LogCollector:
         while not self._stop_event.is_set():
             try:
                 sources = [
-                    s for s in self._loader.get_sources() if s.log_format == _config.LogFormat.JOURNALD
+                    s for s in self._loader.get_valid_confs() if s.log_format == _config.LogFormat.JOURNALD
                     ]
             except Exception:
                 self._stop_event.wait(5.0)
@@ -458,7 +458,7 @@ class LogCollector:
 
             self._stop_event.wait(1.0)
 
-    def _read_journald_source(self, source: _config.LogFormat) -> None:
+    def _read_journald_source(self, source: _config.LocalFile) -> None:
 
         source_key = self._source_key(source)
         state = self._state_store.get_or_create(
