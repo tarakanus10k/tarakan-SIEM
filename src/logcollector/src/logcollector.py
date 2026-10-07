@@ -23,6 +23,7 @@ from .state import (
     DEFAULT_STATE_DIR,
     SourceState, 
     StateStore,
+    PendingAck,
     get_file_inode,
     get_file_size,
     find_rotated_file,
@@ -152,7 +153,7 @@ class LogCollector:
                 try:
                     if fs.state is not None:
                         for msg in fs.reader.flush():
-                            self._process_message(fs.source, msg, fs.state)
+                            self._process_message(fs.source, msg, fs.state, new_offset=fs.state.offset)
                 except Exception:
                     print("error: flush reader")
 
@@ -173,7 +174,7 @@ class LogCollector:
         while not self._stop_event.wait(2.0):
             self._sync_sources()
 
-    def sync_sources(self) -> None:
+    def _sync_sources(self) -> None:
 
         with self._lock:
             try:
@@ -270,6 +271,16 @@ class LogCollector:
         )
         fs.state = state
 
+        source_key = self._source_key(source)
+        max_pending_offset = state.offset
+
+        for ack in self._state_store.pending_acks.all():
+            if ack.source_key == source_key and ack.new_offset is not None:
+                if ack.new_offset > max_pending_offset:
+                    max_pending_offset = ack.new_offset
+
+        fs.read_offset = max_pending_offset
+
         inode = get_file_inode(fs.location)
         size = get_file_size(fs.location)
 
@@ -289,6 +300,7 @@ class LogCollector:
             state.inode = inode
             state.size = size
             state.first_seen = False
+            fs.read_offset = start
             self._state_store.update(state)
 
             return
@@ -303,14 +315,18 @@ class LogCollector:
             fs.file.seek(0)
             state.offset = 0
             state.size = size
+            fs.read_offset = 0
             self._state_store.update(state)
 
             return
 
-        if state.offset > size:
-            state.offset = size
+        start = max(state.offset, fs.read_offset)
 
-        fs.file.seek(state.offset)
+        if start > size:
+            start = size
+
+        fs.file.seek(start)
+        fs.read_offset = start
         state.inode = inode
         state.size = size
         self._state_store.update(state)
@@ -340,17 +356,17 @@ class LogCollector:
                         messages = fs.reader.read(chunk)
 
                         for msg in messages:
-                            self._process_message(fs.source, msg, state)
+                            self._process_message(fs.source, msg, state, new_state=state.offset)
 
             except OSError as e:
                 print("can't read old file")
 
             for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state)
+                self._process_message(fs.source, msg, state, new_state=state.offset)
 
         else:
             for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state)
+                self._process_message(fs.source, msg, state, new_state=state.offset)
 
         try:
             fs.file.close()
@@ -367,6 +383,7 @@ class LogCollector:
         state.offset = 0
         state.inode = new_inode
         state.size = new_size
+        fs.read_offset = 0
         self._state_store.update(state)
 
     # ------------------------------------------------------------------
@@ -394,14 +411,16 @@ class LogCollector:
 
         if detect_rotation(state, fs.location):
             self._handle_rotation(fs, state, old_inode=state.inode or 0)
+            return
 
         if detect_truncate(state, fs.location):
 
             for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state)
+                self._process_message(fs.source, msg, state, new_offset=0)
 
             fs.file.seek(0)
             state.offset = 0
+            fs.read_offset = 0
             state.size = get_file_size(fs.location) or 0
             self._state_store.update(state)
 
@@ -409,24 +428,27 @@ class LogCollector:
         if current_size is None:
             return
 
-        if current_size <= (state.offset or 0):
+        start = max(state.offset, fs.read_offset)
+
+        if current_size <= start:
             return
 
         try:
-            fs.file.seek(state.offset)
-            chunk = fs.file.read(current_size - state.offset)
+            fs.file.seek(start)
+            chunk = fs.file.read(current_size - start)
 
         except OSError as e:
             return
 
+        if not chunk:
+            return
+
         messages = fs.reader.read(chunk)
+        new_offset = start + len(chunk)
+        fs.read_offset = new_offset
 
         for msg in messages:
-            self._process_message(fs.source, msg, state)
-
-        state.offset = state.offset + len(chunk)
-        state.size = current_size
-        self._state_store.update(state)
+            self._process_message(fs.source, msg, state, new_offset=new_offset, new_size=current_size)
 
     # ------------------------------------------------------------------
     # json stream
@@ -483,8 +505,7 @@ class LogCollector:
 
             if entry is not None:
                 raw_message = format_journald_entry(entry)
-                state.cursor = reader.cursor
-                self._process_message(source, raw_message, state)
+                self._process_message(source, raw_message, state, new_cursor=reader.cursor)
 
         except StopIteration:
             pass
@@ -499,7 +520,10 @@ class LogCollector:
             self, 
             source: _config.LocalFile, 
             raw_message: str, 
-            state: SourceState
+            state: SourceState,
+            new_offset: Optional[int] = None,
+            new_size: Optional[int] = None,
+            new_cursor: Optional[int] = None
             ) -> None:
 
         if not raw_message:
@@ -515,14 +539,63 @@ class LogCollector:
         compressed = gzip.compress(obj_json)
 
         try:
-            self._queue.put(compressed)
+            seq = self._queue.put(compressed)
         except QueueFullError as e:
             return
         except Exception:
             return
 
-        state.size = get_file_size(source.location) or state.size
-        self._state_store.update(state)
+        source_key = self._source_key(source)
+
+        ack = PendingAck(
+            seq=seq,
+            source_key=source_key,
+            new_offset=new_offset if new_offset is not None else state.offset,
+            new_cursor=new_cursor,
+            new_size=new_size
+        )
+
+        self._state_store.pending_acks.add(ack)
+
+    def ack_seqs(self, up_to_seq: int) -> int:
+
+        with self._lock:
+            acks = self._state_store.pending_acks.get_up_to(up_to_seq)
+
+            if not acks:
+                return self._queue.ack(up_to_seq)
+
+            by_source: dict[str, PendingAck] = {}
+            for ack in acks:
+                cur = by_source.get(ack.source_key)
+                
+                if cur is None or ack.seq > cur.seq:
+                    by_source[ack.source_key] = ack
+
+            for source_key, ack in by_source.items():
+                state = self._state_store.get(source_key)
+
+                if state is None:
+                    continue
+
+                if ack.new_offset is not None:
+                    state.offset = ack.new_offset
+
+                if ack.new_cursor is not None:
+                    state.cursor = ack.new_cursor
+
+                if ack.new_size is not None:
+                    state.size = ack.new_size
+
+                self._state_store.update(state)
+
+            self._state_store.pending_acks.remove_up_to(up_to_seq)
+
+            return self._queue.ack(up_to_seq)
+
+    @property
+    def queue(self) -> DiskQueue:
+        return self._queue
 
     def _build_log_object(self, source: _config.LocalFile, raw_message: str) -> dict:
 

@@ -126,6 +126,67 @@ class DiskQueue:
             except OSError:
                 return None
 
+    def peek_batch(
+            self, 
+            max_items: int, 
+            skeep_seqs: Optional[set] = None
+            ) -> list[tuple[int, bytes]]:
+
+        if max_items <= 0:
+            return []
+
+        skip = skeep_seqs or set()
+        out: list[tuple[int, bytes]] = []
+
+        with self._lock:
+            seq = self._head
+
+            while seq < self._tail and len(out) < max_items:
+                if seq in skip:
+                    seq += 1
+                    continue
+
+                path = self._item_path(seq)
+
+                if path.exists():
+                    
+                    try:
+
+                        payload = path.read_bytes()
+                        out.append((seq, payload))
+                    except OSError as e:
+                        print("can't read queue element")
+
+                seq += 1
+
+        return out
+
+    def ack(self, seq: int) -> int:
+
+        removed = 0
+
+        with self._lock:
+            seq = min(seq, self._tail - 1)
+
+            while self._head <= seq:
+                path = self._item_path(self._head)
+
+                if path.exists():
+                    try:
+                        size = path.stat().st_size
+                        path.unlink()
+                        self._total_bytes = max(0, self._total_bytes - size)
+                        removed += 1
+                    except OSError as e:
+                        print(path, e)
+
+                self._count = max(0, self._count - 1)
+                self._head += 1
+
+            self._save_meta()
+            
+        return removed
+        
     def size(self) -> int:
         with self._lock:
             return self._count

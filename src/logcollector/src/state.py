@@ -1,7 +1,7 @@
 import json
 import os
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Optional
 from pathlib import Path
 
@@ -9,7 +9,8 @@ from ..include.state import (
     get_default_state_dir,
     get_file_inode,
     get_file_size,
-    find_rotated_file
+    find_rotated_file,
+    get_ack_file
     )
 
 DEFAULT_STATE_DIR = get_default_state_dir()
@@ -28,6 +29,7 @@ class SourceState:
     cursor: Optional[str] = None
 
     first_seen: bool = True
+    extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
 
@@ -39,21 +41,114 @@ class SourceState:
     def from_dict(data: dict) -> "SourceState":
         return SourceState(**{k: v for k, v in data.items() if k in SourceState.__dataclass_fields__})
 
+@dataclass
+class PendingAck:
+
+    seq: int
+    source_key: str
+    new_offset: int
+    new_cursor: Optional[str] = None
+    new_size: Optional[int] = None
+
+class PendingAckStore:
+
+    ACK_FILE = get_ack_file()
+
+    def __init__(self, state_dir: str = DEFAULT_STATE_DIR) -> None:
+
+        self._state_dir = Path(state_dir)
+        self._lock = threading.RLock()
+        self._acks: dict[int, PendingAck] = {}
+
+        try:
+            self._state_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._load_from_disk()
+
+    @property
+    def _path(self) -> Path:
+        return self._state_dir / self.ACK_FILE
+
+    def add(self, ack: PendingAck) -> None:
+        with self._lock:
+            self._acks[ack.seq] = ack
+
+    def get(self, seq: int) -> Optional[PendingAck]:
+        with self._lock:
+            return self._acks.get(seq)
+
+    def get_up_to(self, seq:int) -> list[PendingAck]:
+        with self._lock:
+            return [a for s, a in self._acks.items() if s <= seq]
+
+    def remove_up_to(self, seq: int) -> int:
+        with self._lock:
+
+            to_drop = [s for s in self._acks if s <= seq]
+            
+            for s in to_drop:
+                del self._acks[s]
+
+            return len(to_drop)
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._acks)
+
+    def all(self) -> list[PendingAck]:
+        with self._lock:
+            return list(self._acks.values())
+
+    def flush(self) -> None:
+
+        with self._lock:
+            data = [a.__dict__ for a in self._acks.values()]
+
+        tmp = self._path.with_suffix(".json.tmp")
+
+        try:
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+        except OSError as e:
+            print("can't save pending_acks", e)
+
+    def _load_from_disk(self) -> None:
+        
+        if not self._path.exists():
+            return
+
+        try:
+            with self._path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            for item in data:
+                ack = PendingAck(**item)
+                self._acks[ack.seq] = ack
+
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            print("can't upload pending_acks", e)
+
 class StateStore:
 
     def __init__(
             self, 
             state_dir: Path = DEFAULT_STATE_DIR, 
-            flush_interval: float = 5.0
+            flush_interval: float = 5.0,
+            pending_acks: Optional["PendingAckStore"] = None
             ) -> None:
 
         self._state_dir = Path(state_dir)
         self._flush_interval = flush_interval
         self._states: dict[str, SourceState] = {}
+        self._pending_acks = pending_acks or PendingAckStore(state_dir)
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._flush_thread: Optional[threading.Thread] = None
         self._ensure_dir()
+
+    @property
+    def pending_acks(self) -> "PendingAckStore":
+        return self._pending_acks
 
     def _ensure_dir(self) -> None:
 
@@ -120,7 +215,7 @@ class StateStore:
 
     def _load_from_disk(self, source_key: str) -> Optional[SourceState]:
 
-        path = self._state_dir(source_key)
+        path = self._state_file(source_key)
 
         if not path.exists():
             return None
@@ -164,6 +259,8 @@ class StateStore:
 
         for st in states:
             self._safe_to_disk(st)
+
+        self._pending_acks.flush()
 
     def start_periodic_flush(self) -> None:
 
