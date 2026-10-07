@@ -11,6 +11,14 @@ def get_default_state_dir():
     
     return Path(value.strip())
 
+def get_ack_file():
+    tree = ET.parse("src/logcollector/config/agent.conf")
+    root = tree.getroot()
+
+    value = root.findtext("logcollector/default_ack_file")
+    
+    return str(value.strip())
+
 def get_file_inode(path: str) -> Optional[int]:
     try:
         return os.stat(path).st_ino
