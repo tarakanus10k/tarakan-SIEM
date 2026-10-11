@@ -1,6 +1,7 @@
 import gzip
 import json
 import hashlib
+import logging
 import threading
 import uuid
 import socket
@@ -8,6 +9,8 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from .base_reader import BaseReader
 from .read_multiline_regex import MultilineRegexReader
@@ -154,12 +157,12 @@ class LogCollector:
                     if fs.state is not None:
                         for msg in fs.reader.flush():
                             self._process_message(fs.source, msg, fs.state, new_offset=fs.state.offset)
-                except Exception:
-                    print("error: flush reader")
+                except Exception as e:
+                    logger.warning("error: flush reader: %s", e)
 
         with self._lock:
             for fs in list(self._file_sources.values()):
-                self._unregister_file_sources(fs)
+                self._unregister_file_source(fs)
             self._file_sources.clear()
 
         self._state_store.stop_periodic_flush()
@@ -356,17 +359,17 @@ class LogCollector:
                         messages = fs.reader.read(chunk)
 
                         for msg in messages:
-                            self._process_message(fs.source, msg, state, new_state=state.offset)
+                            self._process_message(fs.source, msg, state, new_offset=state.offset)
 
             except OSError as e:
-                print("can't read old file")
+                logger.warning("can't read old file %s: %s", old_path, e)
 
             for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state, new_state=state.offset)
+                self._process_message(fs.source, msg, state, new_offset=state.offset)
 
         else:
             for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state, new_state=state.offset)
+                self._process_message(fs.source, msg, state, new_offset=state.offset)
 
         try:
             fs.file.close()
@@ -509,8 +512,8 @@ class LogCollector:
 
         except StopIteration:
             pass
-        except Exception:
-            print("error: read journald")
+        except Exception as e:
+            logger.warning("error: read journald: %s", e)
 
     # ------------------------------------------------------------------
     # work with 1 object

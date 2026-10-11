@@ -1,12 +1,15 @@
 import gzip
 import io
 import json
+import logging
 import queue as _queue
 import ssl
 import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from ..include.logtaker import (
     get_default_logtaker_port,
@@ -68,7 +71,8 @@ class LogTaker:
         )
 
         self._thread.start()
-        print(self._cfg.host, self._cfg.port, self._cfg.server_cert is not None)
+        logger.info("logtaker listening on %s:%s tls=%s",
+                    self._cfg.host, self._cfg.port, self._cfg.server_cert is not None)
 
     def stop(self) -> None:
 
@@ -98,9 +102,15 @@ class LogTaker:
     def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
 
         if self._cfg.server_cert is None and self._cfg.server_key is None:
-            print("сертификат сервера не задан — запускаем без TLS (ТОЛЬКО тест)")
+            logger.warning("сертификат сервера не задан — запускаем без TLS (ТОЛЬКО тест)")
             return None
-        
+
+        if self._cfg.require_client_cert and not self._cfg.ca_cert:
+            raise RuntimeError(
+                "require_client_cert=True требует ca_cert — без ca_cert "
+                "mTLS не может быть enforcement и verify_mode останется CERT_NONE"
+            )
+
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
         if self._cfg.server_cert:
@@ -126,7 +136,7 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
     class _Handler(BaseHTTPRequestHandler):
 
         def log_message(self, fmt, *args):
-            print(self.address_string(), fmt % args)
+            logger.info("%s %s", self.address_string(), fmt % args)
 
         def do_GET(self):
             self.send_error(405, "Only POST is allowed")
@@ -144,7 +154,11 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
                 self.send_error(404, "Not found")
                 return
 
-            content_length = int(self.headers.get("Content-Length", 0))
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+            except (TypeError, ValueError):
+                self.send_error(400, "Invalid Content-Length")
+                return
                 
             if content_length <= 0:
                 self.send_error(400, "Empty body")
@@ -165,7 +179,7 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
                                                     cfg.max_request_bytes)
 
             except _DecompressError as e:
-                print(e)
+                logger.warning("decompression error: %s", e)
                 self.send_error(400, f"Decompression error: {e}")
                 return
                 
@@ -176,7 +190,7 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
             try:
                 batch = json.loads(decompressed.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                print(e)
+                logger.warning("invalid JSON: %s", e)
                 self.send_error(400, f"Invalid JSON: {e}")
                 return
 
@@ -192,7 +206,7 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
             try:
                 events_queue.put_nowait(events)
             except _queue.Full:
-                print("внутренняя очередь переполнена, отклоняем пачку")
+                logger.warning("внутренняя очередь переполнена, отклоняем пачку")
                 self.send_error(503, "Internal queue full")
                 return
 
@@ -202,7 +216,7 @@ def _make_handler(cfg: LogTakerConfig, events_queue: _queue.Queue):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-            print(len(events))
+            logger.info("accepted events=%d", len(events))
 
     return _Handler
 

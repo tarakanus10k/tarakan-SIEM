@@ -1,4 +1,7 @@
+import logging
 from typing import Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from systemd import journal as _journal
@@ -38,10 +41,12 @@ class JournaldReader:
             try:
                 reader.seek_cursor(self._cursor)
                 next(reader, None)
+
             except Exception:
+                logger.warning("cursor %r не найден, чтение с конца", self._cursor)
                 reader.seek_tail()
                 next(reader, None)
-
+                
         else:
             reader.seek_tail()
             next(reader, None)
@@ -50,11 +55,20 @@ class JournaldReader:
             reader.log_level(_journal.LOG_DEBUG)
 
         while True:
-            entry = reader.__next__()
+            try:
+                entry = next(reader)
+            except StopIteration:
+                if wait:
+                    reader.wait()
+                    continue
+                else:
+                    return
             if entry is None:
-                reader.wait()
-                continue
-
+                if wait:
+                    reader.wait()
+                    continue
+                else:
+                    return
             self._cursor = entry.get("__CURSOR")
             yield entry
 

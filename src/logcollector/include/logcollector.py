@@ -2,40 +2,51 @@ import socket
 import platform
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
+from functools import lru_cache
+import logging
 
-def get_default_state_flush_interval():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
+logger = logging.getLogger(__name__)
 
-    value = root.findtext("logcollector/default_state_flush_interval")
-    
-    return float(value.strip())
 
-def get_default_selector_timeout():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
+@lru_cache(maxsize=1)
+def _agent_conf_path() -> Path:
 
-    value = root.findtext("logcollector/default_selector_timeout")
-    
-    return float(value.strip())
+    return Path(__file__).resolve().parent.parent / "config" / "agent.conf"
 
-def get_queue_max_items():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
 
-    value = root.findtext("logcollector/queue_max_items")
-    
-    return int(value.strip())
+@lru_cache(maxsize=1)
+def _conf_root() -> ET.Element:
+    tree = ET.parse(_agent_conf_path())
+    return tree.getroot()
 
-def get_queue_max_bytes():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
 
-    value = root.findtext("logcollector/queue_max_bytes")
-    
-    return int(value.strip())
+def _get_text(path: str, default: str = "") -> str:
+    try:
+        v = _conf_root().findtext(path)
+        return (v.strip() if v else default)
+    except (OSError, ET.ParseError) as e:
+        logger.error("не удалось прочитать agent.conf: %s", e)
+        return default
 
-def get_host_ip():
+
+def get_default_state_flush_interval() -> float:
+    return float(_get_text("logcollector/default_state_flush_interval", "5.0") or "5.0")
+
+
+def get_default_selector_timeout() -> float:
+    return float(_get_text("logcollector/default_selector_timeout", "1.0") or "1.0")
+
+
+def get_queue_max_items() -> int:
+    return int(_get_text("logcollector/queue_max_items", "100000") or "100000")
+
+
+def get_queue_max_bytes() -> int:
+    return int(_get_text("logcollector/queue_max_bytes", "1073741824") or "1073741824")
+
+
+def get_host_ip() -> str:
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 

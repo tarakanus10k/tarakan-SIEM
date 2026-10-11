@@ -54,7 +54,7 @@ class JsonReader(BaseReader):
                 i += 1
                 continue
 
-            end = find_object_end(text, 1)
+            end = find_object_end(text, i)
             if end == -1:
                 return messages, text[i:]
 

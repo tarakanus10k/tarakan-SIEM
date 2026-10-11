@@ -1,9 +1,12 @@
 import json
+import logging
 import os
 import threading
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from ..include.state import (
     get_default_state_dir,
@@ -63,7 +66,9 @@ class PendingAckStore:
         try:
             self._state_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self._load_from_disk()
+            logger.warning("не удалось создать директорию %s: %s", self._state_dir, e)
+
+        self._load_from_disk()  # вызывается ВСЕГДА, независимо от mkdir
 
     @property
     def _path(self) -> Path:
@@ -109,8 +114,9 @@ class PendingAckStore:
         try:
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
-        except OSError as e:
-            print("can't save pending_acks", e)
+            os.replace(tmp, self._path)
+        except (OSError, ValueError) as e:
+            logger.warning("can't save pending_acks: %s", e)
 
     def _load_from_disk(self) -> None:
         
@@ -126,7 +132,7 @@ class PendingAckStore:
                 self._acks[ack.seq] = ack
 
         except (OSError, json.JSONDecodeError, TypeError) as e:
-            print("can't upload pending_acks", e)
+            logger.warning("can't load pending_acks: %s", e)
 
 class StateStore:
 
@@ -155,7 +161,7 @@ class StateStore:
         try:
             self._state_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            print("can't create state dirs")
+            logger.warning("can't create state dirs: %s", e)
 
     def get(self, source_key: str) -> Optional[SourceState]:
 
@@ -232,7 +238,7 @@ class StateStore:
     def _safe_to_disk(self, state: SourceState) -> None:
 
         path = self._state_file(state.source_key)
-        tmp = path.with_suffix("json.tmp")
+        tmp = path.with_suffix(".json.tmp")
 
         try:
             with tmp.open("w", encoding="utf-8") as f:
@@ -240,8 +246,8 @@ class StateStore:
 
             os.replace(tmp, path)
 
-        except OSError as e:
-            print("can't safe state")
+        except (OSError, ValueError) as e:
+            logger.warning("can't save state %s: %s", state.source_key, e)
 
     def _delete_from_disk(self, source_key: str) -> None:
 
@@ -250,7 +256,7 @@ class StateStore:
         try:
             path.unlink(missing_ok=True)
         except OSError as e:
-            print("can't delete state")
+            logger.warning("can't delete state %s: %s", path, e)
 
     def flush(self) -> None:
 
@@ -289,8 +295,8 @@ class StateStore:
         while not self._stop_event.wait(self._flush_interval):
             try:
                 self.flush()
-            except Exception:
-                print("error: periodical state flush")
+            except Exception as e:
+                logger.warning("error: periodical state flush: %s", e)
 
 def detect_rotation(state: SourceState, path: str) -> bool:
 

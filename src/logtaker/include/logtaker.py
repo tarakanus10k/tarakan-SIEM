@@ -2,35 +2,43 @@ import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
+from functools import lru_cache
+import logging
 
-def get_default_logtaker_port():
-    tree = ET.parse("src/logtaker/config/agent.conf")
-    root = tree.getroot()
+logger = logging.getLogger(__name__)
 
-    value = root.findtext("logtaker/default_logtaker_port")
-    
-    return int(value.strip())
 
-def get_host():
-    tree = ET.parse("src/logtaker/config/agent.conf")
-    root = tree.getroot()
+@lru_cache(maxsize=1)
+def _agent_conf_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "config" / "agent.conf"
 
-    value = root.findtext("logtaker/host")
-    
-    return str(value.strip())
 
-def get_internal_queue_size():
-    tree = ET.parse("src/logtaker/config/agent.conf")
-    root = tree.getroot()
+@lru_cache(maxsize=1)
+def _conf_root() -> ET.Element:
+    tree = ET.parse(_agent_conf_path())
+    return tree.getroot()
 
-    value = root.findtext("logtaker/internal_queue_size")
-    
-    return int(value.strip())
 
-def get_max_request_bytes():
-    tree = ET.parse("src/logtaker/config/agent.conf")
-    root = tree.getroot()
+def _get_text(path: str, default: str = "") -> str:
+    try:
+        v = _conf_root().findtext(path)
+        return (v.strip() if v else default)
+    except (OSError, ET.ParseError) as e:
+        logger.error("не удалось прочитать agent.conf: %s", e)
+        return default
 
-    value = root.findtext("logtaker/max_request_bytes")
-    
-    return int(value.strip())
+
+def get_default_logtaker_port() -> int:
+    return int(_get_text("logtaker/default_logtaker_port", "8443") or "8443")
+
+
+def get_host() -> str:
+    return _get_text("logtaker/host", "0.0.0.0")
+
+
+def get_internal_queue_size() -> int:
+    return int(_get_text("logtaker/internal_queue_size", "10000") or "10000")
+
+
+def get_max_request_bytes() -> int:
+    return int(_get_text("logtaker/max_request_bytes", "67108864") or "67108864")

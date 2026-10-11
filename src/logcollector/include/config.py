@@ -5,30 +5,45 @@ from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
 from enum import Enum
+from functools import lru_cache
+import logging
 
-def get_dir_path():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
+logger = logging.getLogger(__name__)
 
-    value = root.findtext("agent/default_log_conf")
 
-    return Path(value.strip())
+@lru_cache(maxsize=1)
+def _agent_conf_path() -> Path:
 
-def get_retry_interval():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
+    return Path(__file__).resolve().parent.parent / "config" / "agent.conf"
 
-    value = root.findtext("agent/default_retry_interval")
-    
-    return float(value.strip())
 
-def get_scan_interval():
-    tree = ET.parse("src/logcollector/config/agent.conf")
-    root = tree.getroot()
-    
-    value = root.findtext("agent/default_scan_interval")
-        
-    return float(value.strip())
+@lru_cache(maxsize=1)
+def _conf_root() -> ET.Element:
+    tree = ET.parse(_agent_conf_path())
+    return tree.getroot()
+
+
+def _get_text(path: str, default: str = "") -> str:
+    try:
+        v = _conf_root().findtext(path)
+        return (v.strip() if v else default)
+    except (OSError, ET.ParseError) as e:
+        logger.error("не удалось прочитать agent.conf: %s", e)
+        return default
+
+
+def get_dir_path() -> Path:
+    return Path(_get_text("agent/default_log_conf",
+                          "src/logcollector/config/conf.d"))
+
+
+def get_retry_interval() -> float:
+    return float(_get_text("agent/default_retry_interval", "30.0") or "30.0")
+
+
+def get_scan_interval() -> float:
+    return float(_get_text("agent/default_scan_interval", "60.0") or "60.0")
+
 
 class LogFormat(str, Enum):
 

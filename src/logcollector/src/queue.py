@@ -1,9 +1,12 @@
 from dataclasses import dataclass
 from typing import Optional
 from pathlib import Path
+import logging
 import threading
 import os
 import json
+
+logger = logging.getLogger(__name__)
 
 from ..include.queue import (
     get_default_queue_dir,
@@ -102,7 +105,7 @@ class DiskQueue:
             try:
                 path.unlink()
             except OSError as e:
-                print("can't delete the queue-element")
+                logger.warning("can't delete the queue-element: %s", e)
 
             self._head += 1
             self._count -= 1
@@ -127,15 +130,15 @@ class DiskQueue:
                 return None
 
     def peek_batch(
-            self, 
-            max_items: int, 
-            skeep_seqs: Optional[set] = None
+            self,
+            max_items: int,
+            skip_seqs: Optional[set] = None
             ) -> list[tuple[int, bytes]]:
 
         if max_items <= 0:
             return []
 
-        skip = skeep_seqs or set()
+        skip = skip_seqs or set()
         out: list[tuple[int, bytes]] = []
 
         with self._lock:
@@ -155,7 +158,7 @@ class DiskQueue:
                         payload = path.read_bytes()
                         out.append((seq, payload))
                     except OSError as e:
-                        print("can't read queue element")
+                        logger.warning("can't read queue element %s: %s", path, e)
 
                 seq += 1
 
@@ -178,7 +181,7 @@ class DiskQueue:
                         self._total_bytes = max(0, self._total_bytes - size)
                         removed += 1
                     except OSError as e:
-                        print(path, e)
+                        logger.warning("can't delete queue item %s: %s", path, e)
 
                 self._count = max(0, self._count - 1)
                 self._head += 1
@@ -318,4 +321,4 @@ class DiskQueue:
             os.replace(tmp, path)
 
         except OSError as e:
-            print("can't save queue meta.json")
+            logger.warning("can't save queue meta.json: %s", e)

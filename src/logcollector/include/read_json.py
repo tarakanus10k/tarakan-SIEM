@@ -47,3 +47,5 @@ def is_valid_json(candidate: str) -> bool:
         json.loads(candidate)
     except (json.JSONDecodeError, ValueError):
         return False
+
+    return True

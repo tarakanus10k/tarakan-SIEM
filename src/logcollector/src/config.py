@@ -1,19 +1,28 @@
 import os
 import fnmatch
+import logging
 from dataclasses import dataclass
 from typing import Optional, Callable
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import threading
 
-import inotify.adapters
-from inotify.constants import (
-    IN_MODIFY,
-    IN_CREATE,
-    IN_DELETE,
-    IN_MOVED_FROM,
-    IN_MOVED_TO
-    )
+logger = logging.getLogger(__name__)
+
+try:
+    import inotify.adapters
+    from inotify.constants import (
+        IN_MODIFY,
+        IN_CREATE,
+        IN_DELETE,
+        IN_MOVED_FROM,
+        IN_MOVED_TO
+        )
+    _HAS_INOTIFY = True
+except ImportError:
+    inotify = None
+    _HAS_INOTIFY = False
+    IN_MODIFY = IN_CREATE = IN_DELETE = IN_MOVED_FROM = IN_MOVED_TO = 0
 
 from ..include.config import (
     get_dir_path, 
@@ -171,7 +180,7 @@ class AgentLogConfig:
         try:
             tree = ET.parse(conf_path)
         except ET.ParseError as e:
-            print(f"parse error: {e}")
+            logger.warning("parse error in %s: %s", conf_path, e)
             return []
 
         root = tree.getroot()
@@ -296,9 +305,13 @@ class AgentLogConfig:
     def _watch_loop(self) -> None:
 
         watcher: _Watcher
-        inotify_watcher = _InotifyWatcher(self.conf_dir_path, "*.conf", self._conf_changing)
-
-        watcher = inotify_watcher
+        if _HAS_INOTIFY:
+            inotify_watcher = _InotifyWatcher(self.conf_dir_path, "*.conf", self._conf_changing)
+            watcher = inotify_watcher
+        else:
+            logger.info("inotify недоступен, fallback на _ScanWatcher (периодическое сканирование)")
+            watcher = _ScanWatcher(self.conf_dir_path, "*.conf", self._conf_changing,
+                                   scan_interval=float(self.conf_scan_interval))
 
         watcher.start()
 
@@ -398,3 +411,46 @@ class _InotifyWatcher(_Watcher):
             self._inotify.remove_watch(str(self.conf_dir_path))
         except Exception:
             pass
+
+
+class _ScanWatcher(_Watcher):
+    """Fallback: периодическое сканирование mtime .conf-файлов.
+
+    Используется, когда модуль `inotify` недоступен (например, на файловых
+    системах без inotify или в среде без установленного пакета).
+    """
+
+    def __init__(
+            self,
+            conf_dir_path: Path,
+            pattern: str,
+            callback: Callable[[str], None],
+            scan_interval: float = 2.0
+            ) -> None:
+
+        super().__init__(conf_dir_path, pattern, callback)
+        self._scan_interval = float(scan_interval) if scan_interval and scan_interval > 0 else 2.0
+        self._mtimes: dict[str, float] = {}
+
+    def _run(self) -> None:
+
+        while not self._stop.wait(self._scan_interval):
+            try:
+                if not self.conf_dir_path.is_dir():
+                    continue
+
+                current_mtimes: dict[str, float] = {}
+                for conf_file in self.conf_dir_path.glob(self.pattern):
+                    if conf_file.is_file():
+                        try:
+                            current_mtimes[str(conf_file)] = conf_file.stat().st_mtime
+                        except OSError as e:
+                            logger.warning("can't stat %s: %s", conf_file, e)
+
+                for fpath, mtime in current_mtimes.items():
+                    if fpath not in self._mtimes or self._mtimes[fpath] != mtime:
+                        self.callback(fpath)
+
+                self._mtimes = current_mtimes
+            except Exception as e:
+                logger.warning("_ScanWatcher iteration failed: %s", e)

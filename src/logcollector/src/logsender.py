@@ -1,5 +1,6 @@
 import gzip
 import json
+import logging
 import os
 import ssl
 import threading
@@ -10,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from ..include.logsender import (
     get_default_sender_spool_dir,
@@ -22,6 +25,8 @@ from ..include.logsender import (
     get_batch_timeout,
     get_max_retries,
     get_http_timeout,
+
+    get_dead_letter_dir,
 
     utc_now_iso
 )
@@ -49,9 +54,11 @@ class LogSenderConfig:
     backoff_base: float = DEFAULT_BACKOFF_BASE
     backoff_max: float = DEFAULT_BACKOFF_MAX
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR
-    max_retries: int = get_max_retries
+    max_retries: int = get_max_retries()
 
-    http_timeout: float = get_http_timeout
+    http_timeout: float = get_http_timeout()
+
+    dead_letter_dir: str = get_dead_letter_dir()
 
 class LogSender:
 
@@ -140,10 +147,10 @@ class LogSender:
                         loaded += 1
 
             except (OSError, json.JSONDecodeError) as e:
-                print(meta_path, e)
+                logger.warning("can't read spool meta %s: %s", meta_path, e)
 
         if loaded:
-            print(loaded)
+            logger.info("loaded %d in-flight seqs from spool", loaded)
         
         return loaded
 
@@ -160,8 +167,8 @@ class LogSender:
                 if self._is_batch_ready():
                     self._flush_buffer_to_spool()
 
-            except Exception:
-                print("error")
+            except Exception as e:
+                logger.warning("logsender main loop error: %s", e)
 
             self._stop_event.wait(0.5)
 
@@ -176,8 +183,8 @@ class LogSender:
 
         try:
             batch = self._collector.queue.peek_batch(needed, skip_seqs=in_flight_snapshot)
-        except Exception:
-            print("не удалось прочитать пачку из DiskQueue")
+        except Exception as e:
+            logger.warning("не удалось прочитать пачку из DiskQueue: %s", e)
             return
 
         if not batch:
@@ -193,7 +200,8 @@ class LogSender:
 
             for seq, _ in batch:
                 self._in_flight.add(seq)
-            print(len(self._buffer), self._cfg.batch_size, len(self._in_flight))
+            logger.debug("buffer=%d batch_size=%d in_flight=%d",
+                         len(self._buffer), self._cfg.batch_size, len(self._in_flight))
 
     def _is_batch_ready(self) -> bool:
 
@@ -228,12 +236,13 @@ class LogSender:
                 events.append(single)
                 seqs.append(seq)
             except (json.JSONDecodeError, OSError) as e:
-                print(seq, e,)
-
-                try:
-                    self._collector.ack_seqs(seq)
-                except Exception:
-                    print(seq)
+                # A13: corrupt-элемент сохраняем в dead-letter, НЕ ack'аем.
+                # seq остаётся в очереди (и в _in_flight) для ручного разбора.
+                logger.error("corrupt element seq=%s, moving to dead_letter: %s",
+                             seq, e)
+                self._save_to_dead_letter(
+                    f"corrupt-{seq}-{uuid.uuid4().hex}.bin", compressed
+                )
 
         if not events:
             return None
@@ -271,10 +280,11 @@ class LogSender:
 
             os.replace(meta_tmp, meta_path)
         except OSError as e:
-            print(path, e)
+            logger.warning("can't write spool %s: %s", path, e)
             return None
 
-        print(path.name, len(events), len(payload))
+        logger.info("wrote spool %s events=%d bytes=%d",
+                    path.name, len(events), len(payload))
         return str(path)
 
     def _send_pending_spool(self) -> None:
@@ -309,7 +319,7 @@ class LogSender:
                 seqs = meta.get("seqs", [])
 
         except OSError as e:
-            print(path, e)
+            logger.warning("can't read spool %s: %s", path, e)
             return
 
         success = False
@@ -327,19 +337,39 @@ class LogSender:
                     break
 
                 if 400 <= status < 500:
-                    print(status, path.name)
-                    success = True
+
+                    logger.error(
+                        "server returned %s for spool %s, moving to dead_letter %s",
+                        status, path.name, self._cfg.dead_letter_dir
+                    )
+
+                    if self._save_to_dead_letter(path.name, payload):
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError as e:
+                            logger.warning("can't delete spool %s: %s", path, e)
+
+                    try:
+                        meta_path.unlink(missing_ok=True)
+                    except OSError as e:
+                        logger.warning("can't delete meta %s: %s", meta_path, e)
+
                     break
 
-                print(status, path.name, attempt, backoff)
+                logger.warning("server returned %s for spool %s attempt=%d backoff=%.2f",
+                               status, path.name, attempt, backoff)
+                
             except (urllib.error.URLError, OSError, ssl.SSLError) as e:
-                print(path.name, attempt, e, backoff)
+                logger.warning("network error spool=%s attempt=%d backoff=%.2f: %s",
+                               path.name, attempt, backoff, e)
 
-            except Exception:
-                print(path.name, attempt)
+            except Exception as e:
+                logger.warning("unexpected error spool=%s attempt=%d: %s",
+                               path.name, attempt, e)
 
             if self._cfg.max_retries and attempt >= self._cfg.max_retries:
-                print(self._cfg.max_retries, path.name,)
+                logger.warning("max_retries=%d reached for spool %s, giving up",
+                               self._cfg.max_retries, path.name)
                 return
             
             self._stop_event.wait(backoff)
@@ -349,8 +379,9 @@ class LogSender:
             if seqs:
                 try:
                     self._collector.ack_seqs(max(seqs))
-                except Exception:
-                    print(seqs, path.name)
+                except Exception as e:
+                    logger.warning("can't ack seqs=%s spool=%s: %s",
+                                   seqs, path.name, e)
 
                 with self._lock:
                     for s in seqs:
@@ -360,9 +391,9 @@ class LogSender:
                 path.unlink(missing_ok=True)
                 meta_path.unlink(missing_ok=True)
             except OSError as e:
-                print(path, e)
+                logger.warning("can't delete spool %s: %s", path, e)
 
-            print(path.name, len(seqs))
+            logger.info("sent spool %s seqs=%d", path.name, len(seqs))
 
     def _post(self, payload: bytes) -> int:
 
@@ -403,4 +434,26 @@ class LogSender:
         try:
             self._spool_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            print(self._spool_dir, e)
+            logger.warning("can't create spool dir %s: %s", self._spool_dir, e)
+
+    def _save_to_dead_letter(self, name: str, data: bytes) -> Optional[Path]:
+
+        try:
+
+            dl_dir = Path(self._cfg.dead_letter_dir)
+            dl_dir.mkdir(parents=True, exist_ok=True)
+            target = dl_dir / name
+            tmp = target.with_suffix(".bin.tmp")
+
+            with tmp.open("wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(tmp, target)
+            return target
+        
+        except OSError as e:
+            logger.error("can't save to dead_letter %s/%s: %s",
+                         self._cfg.dead_letter_dir, name, e)
+            return None
