@@ -24,12 +24,13 @@ from .read_journald import (
 )
 from .state import (
     DEFAULT_STATE_DIR,
-    SourceState, 
+    SourceState,
     StateStore,
     PendingAck,
     get_file_inode,
     get_file_size,
     find_rotated_file,
+    guess_rotated_file,
     detect_rotation,
     detect_truncate
     )
@@ -60,6 +61,7 @@ class _FileSource:
     location: str
     reader: BaseReader
     state: Optional[SourceState] = None
+    read_offset: int = 0
 
 @dataclass
 class LogCollectorConfig:
@@ -94,6 +96,7 @@ class LogCollector:
         self._os_info = get_os_info()
 
         self._file_sources: dict[str, _FileSource] = {}
+        self._journald_readers: dict[str, JournaldReader] = {}
         self._stop_event = threading.Event()
         self._threads: list[threading.Thread] = []
         self._lock = threading.RLock()
@@ -181,7 +184,7 @@ class LogCollector:
 
         with self._lock:
             try:
-                sources = self._loader.get_valid_confs()
+                sources = self._loader.load_all()
             except Exception:
                 return
 
@@ -225,10 +228,20 @@ class LogCollector:
             reader=reader
         )
 
+        try:
+            self._init_file_position(fs)
+        except Exception as e:
+            logger.warning("can't init file position for %s: %s", location, e)
+
+            try:
+                f.close()
+            except OSError:
+                pass
+
+            return
+
         with self._lock:
             self._file_sources[location] = fs
-
-        self._init_file_position(fs)
 
     def _unregister_file_source(self, fs: _FileSource) -> None:
 
@@ -239,6 +252,22 @@ class LogCollector:
             fs.file.close()
         except OSError:
             pass
+
+    def _reopen_file(self, fs: _FileSource) -> bool:
+
+        try:
+            if not fs.file.closed:
+                fs.file.close()
+        except OSError:
+            pass
+
+        try:
+            fs.file = open(fs.location, "rb", buffering=0)
+        except OSError as e:
+            logger.warning("can't reopen %s: %s", fs.location, e)
+            return False
+
+        return True
 
     def _make_reader(self, source: _config.LocalFile) -> BaseReader:
 
@@ -278,7 +307,9 @@ class LogCollector:
         max_pending_offset = state.offset
 
         for ack in self._state_store.pending_acks.all():
-            if ack.source_key == source_key and ack.new_offset is not None:
+            if (ack.source_key == source_key
+                    and ack.new_offset is not None
+                    and ack.generation == state.generation):
                 if ack.new_offset > max_pending_offset:
                     max_pending_offset = ack.new_offset
 
@@ -315,7 +346,13 @@ class LogCollector:
 
         if detect_truncate(state, fs.location):
 
-            fs.file.seek(0)
+            try:
+                fs.file.seek(0)
+            except (OSError, ValueError):
+                if not self._reopen_file(fs):
+                    return
+
+            state.generation += 1
             state.offset = 0
             state.size = size
             fs.read_offset = 0
@@ -335,9 +372,35 @@ class LogCollector:
         self._state_store.update(state)
 
     def _handle_rotation(
-            self, 
-            fs: _FileSource, 
-            state: SourceState, 
+            self,
+            fs: _FileSource,
+            state: SourceState,
+            old_inode: int
+            ) -> None:
+
+        self._read_rotated_backlog(fs, state, old_inode)
+
+        state.generation += 1
+        state.offset = 0
+        fs.read_offset = 0
+
+        if not self._reopen_file(fs):
+            state.inode = get_file_inode(fs.location)
+            state.size = get_file_size(fs.location)
+            self._state_store.update(state)
+            logger.warning("can't reopen %s after rotation — retry later", fs.location)
+            return
+
+        new_inode = get_file_inode(fs.location)
+        new_size = get_file_size(fs.location)
+        state.inode = new_inode
+        state.size = new_size
+        self._state_store.update(state)
+
+    def _read_rotated_backlog(
+            self,
+            fs: _FileSource,
+            state: SourceState,
             old_inode: int
             ) -> None:
 
@@ -345,10 +408,22 @@ class LogCollector:
         hint_name = Path(fs.location).name
         old_path = find_rotated_file(old_inode, hint_dir, hint_name)
 
-        if old_path:
-            try:
+        if not old_path:
+            old_path = guess_rotated_file(hint_dir, hint_name)
+
+        if not old_path:
+            for msg in fs.reader.flush():
+                self._process_message(fs.source, msg, state, new_offset=state.offset)
+            return
+
+        skip = max(state.offset, fs.read_offset)
+
+        try:
+            if old_path.endswith(".gz"):
+                self._feed_rotated_gz(fs, state, old_path, skip)
+            else:
                 with open(old_path, "rb") as old_f:
-                    old_f.seek(state.offset)
+                    old_f.seek(skip)
 
                     while True:
                         chunk = old_f.read(64 * 1024)
@@ -361,33 +436,41 @@ class LogCollector:
                         for msg in messages:
                             self._process_message(fs.source, msg, state, new_offset=state.offset)
 
-            except OSError as e:
-                logger.warning("can't read old file %s: %s", old_path, e)
-
-            for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state, new_offset=state.offset)
-
-        else:
-            for msg in fs.reader.flush():
-                self._process_message(fs.source, msg, state, new_offset=state.offset)
-
-        try:
-            fs.file.close()
-        except OSError:
-            pass
-
-        try:
-            fs.file = open(fs.location, "rb", buffering=0)
         except OSError as e:
-            return
+            logger.warning("can't read old file %s: %s", old_path, e)
 
-        new_inode = get_file_inode(fs.location)
-        new_size = get_file_size(fs.location)
-        state.offset = 0
-        state.inode = new_inode
-        state.size = new_size
-        fs.read_offset = 0
-        self._state_store.update(state)
+        for msg in fs.reader.flush():
+            self._process_message(fs.source, msg, state, new_offset=state.offset)
+
+    def _feed_rotated_gz(
+            self,
+            fs: _FileSource,
+            state: SourceState,
+            old_path: str,
+            skip: int
+            ) -> None:
+
+        with gzip.open(old_path, "rb") as gz:
+            remaining = skip
+
+            while remaining > 0:
+                chunk = gz.read(min(64 * 1024, remaining))
+
+                if not chunk:
+                    return
+
+                remaining -= len(chunk)
+
+            while True:
+                chunk = gz.read(64 * 1024)
+
+                if not chunk:
+                    break
+
+                messages = fs.reader.read(chunk)
+
+                for msg in messages:
+                    self._process_message(fs.source, msg, state, new_offset=state.offset)
 
     # ------------------------------------------------------------------
     # file stream
@@ -403,7 +486,11 @@ class LogCollector:
                 if self._stop_event.is_set():
                     break
 
-                self._poll_sources(fs)
+                try:
+                    self._poll_sources(fs)
+                except Exception as e:
+                    logger.warning("error polling source %s: %s", fs.location, e)
+
             self._stop_event.wait(self._cfg.default_selector_timeout)
 
     def _poll_sources(self, fs: _FileSource) -> None:
@@ -411,6 +498,10 @@ class LogCollector:
         state = fs.state
         if state is None:
             return
+
+        if fs.file.closed:
+            if not self._reopen_file(fs):
+                return
 
         if detect_rotation(state, fs.location):
             self._handle_rotation(fs, state, old_inode=state.inode or 0)
@@ -421,7 +512,14 @@ class LogCollector:
             for msg in fs.reader.flush():
                 self._process_message(fs.source, msg, state, new_offset=0)
 
-            fs.file.seek(0)
+            state.generation += 1
+
+            try:
+                fs.file.seek(0)
+            except (OSError, ValueError):
+                if not self._reopen_file(fs):
+                    return
+
             state.offset = 0
             fs.read_offset = 0
             state.size = get_file_size(fs.location) or 0
@@ -440,8 +538,18 @@ class LogCollector:
             fs.file.seek(start)
             chunk = fs.file.read(current_size - start)
 
-        except OSError as e:
-            return
+        except (OSError, ValueError) as e:
+            logger.warning("read failed for %s: %s — reopening", fs.location, e)
+
+            if not self._reopen_file(fs):
+                return
+
+            try:
+                fs.file.seek(start)
+                chunk = fs.file.read(current_size - start)
+            except (OSError, ValueError) as e2:
+                logger.warning("read failed again for %s: %s", fs.location, e2)
+                return
 
         if not chunk:
             return
@@ -476,6 +584,11 @@ class LogCollector:
                 self._stop_event.wait(10.0)
                 continue
 
+            valid_keys = {self._source_key(s) for s in sources}
+            for key in list(self._journald_readers.keys()):
+                if key not in valid_keys:
+                    self._journald_readers.pop(key, None)
+
             for source in sources:
                 if self._stop_event.is_set():
                     break
@@ -495,20 +608,30 @@ class LogCollector:
         field = source.filter.field if source.filter else None
         pattern = source.filter.pattern if source.filter else None
 
-        try:
-            reader = JournaldReader(
-                cursor=state.cursor, field=field, pattern=pattern
-            )
-        except RuntimeError as e:
-            return
+        reader = self._journald_readers.get(source_key)
+
+        if reader is None:
+            try:
+                reader = JournaldReader(
+                    cursor=state.cursor, field=field, pattern=pattern
+                )
+            except RuntimeError as e:
+                logger.warning("journald reader unavailable for %s: %s",
+                               source.location, e)
+                return
+
+            self._journald_readers[source_key] = reader
 
         try:
-            gen = reader.iter_entries(wait=True)
-            entry = next(gen, None)
+            drained = 0
 
-            if entry is not None:
+            for entry in reader.iter_entries(wait=True):
                 raw_message = format_journald_entry(entry)
                 self._process_message(source, raw_message, state, new_cursor=reader.cursor)
+                drained += 1
+
+                if drained >= JournaldReader.DRAIN_LIMIT:
+                    break
 
         except StopIteration:
             pass
@@ -555,7 +678,8 @@ class LogCollector:
             source_key=source_key,
             new_offset=new_offset if new_offset is not None else state.offset,
             new_cursor=new_cursor,
-            new_size=new_size
+            new_size=new_size,
+            generation=state.generation
         )
 
         self._state_store.pending_acks.add(ack)
@@ -581,6 +705,12 @@ class LogCollector:
                 if state is None:
                     continue
 
+                if ack.generation != state.generation:
+                    logger.debug(
+                        "skip stale ack seq=%s (gen %s != current %s) for %s", ack.seq, ack.generation, state.generation, source_key
+                    )
+                    continue
+
                 if ack.new_offset is not None:
                     state.offset = ack.new_offset
 
@@ -595,6 +725,50 @@ class LogCollector:
             self._state_store.pending_acks.remove_up_to(up_to_seq)
 
             return self._queue.ack(up_to_seq)
+
+    def ack_seqs_exact(self, seqs) -> int:
+
+        wanted = sorted({int(s) for s in seqs})
+
+        if not wanted:
+            return 0
+
+        with self._lock:
+            acks = self._state_store.pending_acks.get_exact(wanted)
+
+            by_source: dict[str, PendingAck] = {}
+            for ack in acks:
+                cur = by_source.get(ack.source_key)
+
+                if cur is None or ack.seq > cur.seq:
+                    by_source[ack.source_key] = ack
+
+            for source_key, ack in by_source.items():
+                state = self._state_store.get(source_key)
+
+                if state is None:
+                    continue
+
+                if ack.generation != state.generation:
+                    logger.debug(
+                        "skip stale ack seq=%s (gen %s != current %s) for %s", ack.seq, ack.generation, state.generation, source_key
+                    )
+                    continue
+
+                if ack.new_offset is not None:
+                    state.offset = ack.new_offset
+
+                if ack.new_cursor is not None:
+                    state.cursor = ack.new_cursor
+
+                if ack.new_size is not None:
+                    state.size = ack.new_size
+
+                self._state_store.update(state)
+
+            self._state_store.pending_acks.remove_exact(wanted)
+
+            return self._queue.ack_exact(wanted)
 
     @property
     def queue(self) -> DiskQueue:

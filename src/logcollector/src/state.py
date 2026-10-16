@@ -13,6 +13,7 @@ from ..include.state import (
     get_file_inode,
     get_file_size,
     find_rotated_file,
+    guess_rotated_file,
     get_ack_file
     )
 
@@ -34,6 +35,8 @@ class SourceState:
     first_seen: bool = True
     extra: dict = field(default_factory=dict)
 
+    generation: int = 0
+
     def to_dict(self) -> dict:
 
         d = asdict(self)
@@ -52,6 +55,7 @@ class PendingAck:
     new_offset: int
     new_cursor: Optional[str] = None
     new_size: Optional[int] = None
+    generation: int = 0
 
 class PendingAckStore:
 
@@ -68,7 +72,7 @@ class PendingAckStore:
         except OSError as e:
             logger.warning("не удалось создать директорию %s: %s", self._state_dir, e)
 
-        self._load_from_disk()  # вызывается ВСЕГДА, независимо от mkdir
+        self._load_from_disk()
 
     @property
     def _path(self) -> Path:
@@ -91,6 +95,24 @@ class PendingAckStore:
 
             to_drop = [s for s in self._acks if s <= seq]
             
+            for s in to_drop:
+                del self._acks[s]
+
+            return len(to_drop)
+
+    def get_exact(self, seqs) -> list[PendingAck]:
+        
+        with self._lock:
+            wanted = {int(s) for s in seqs}
+
+            return [self._acks[s] for s in sorted(wanted) if s in self._acks]
+
+    def remove_exact(self, seqs) -> int:
+        with self._lock:
+            wanted = {int(s) for s in seqs}
+
+            to_drop = [s for s in self._acks if s in wanted]
+
             for s in to_drop:
                 del self._acks[s]
 

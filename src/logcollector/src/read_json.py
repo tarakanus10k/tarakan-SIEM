@@ -1,7 +1,8 @@
+import logging
 from typing import Union
 
 from .base_reader import (
-    BaseReader, 
+    BaseReader,
     decode_chunk
     )
 
@@ -9,6 +10,8 @@ from ..include.read_json import (
     find_object_end,
     is_valid_json
 )
+
+logger = logging.getLogger(__name__)
 
 class JsonReader(BaseReader):
 
@@ -58,7 +61,15 @@ class JsonReader(BaseReader):
             if end == -1:
                 return messages, text[i:]
 
-            messages.append(text[i:end + 1])
+            candidate = text[i:end + 1]
             i = end + 1
+
+            if not is_valid_json(candidate):
+                logger.debug(
+                    "drop brace-matched but invalid JSON fragment (%d bytes)", len(candidate)
+                )
+                continue
+
+            messages.append(candidate)
 
         return messages, ""

@@ -1,4 +1,3 @@
-import os
 import glob
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -10,39 +9,95 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @lru_cache(maxsize=1)
 def _agent_conf_path() -> Path:
 
     return Path(__file__).resolve().parent.parent / "config" / "agent.conf"
 
-
 @lru_cache(maxsize=1)
-def _conf_root() -> ET.Element:
-    tree = ET.parse(_agent_conf_path())
-    return tree.getroot()
-
+def _conf_root() -> Optional[ET.Element]:
+    try:
+        tree = ET.parse(_agent_conf_path())
+        return tree.getroot()
+    except (OSError, ET.ParseError) as e:
+        logger.error("не удалось прочитать agent.conf: %s", e)
+        return None
 
 def _get_text(path: str, default: str = "") -> str:
+    root = _conf_root()
+    if root is None:
+        return default
+
     try:
-        v = _conf_root().findtext(path)
-        return (v.strip() if v else default)
+        v = root.findtext(path)
     except (OSError, ET.ParseError) as e:
         logger.error("не удалось прочитать agent.conf: %s", e)
         return default
 
+    return (v.strip() if v else default)
+
+def _get_int(path: str, default: int) -> int:
+    raw = _get_text(path, "")
+    if not raw:
+        return default
+
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("неверное целое в agent.conf %s=%r — использую default %s", path, raw, default)
+        return default
+
+
+def _get_float(path: str, default: float) -> float:
+    raw = _get_text(path, "")
+    if not raw:
+        return default
+
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("неверное число в agent.conf %s=%r — использую default %s", path, raw, default)
+        return default
+
+
+def _resolve_path(raw: str) -> Path:
+    p = Path(raw)
+
+    if p.is_absolute():
+        return p
+
+    cwd_candidate = Path.cwd() / p
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    repo_candidate = _REPO_ROOT / p
+    if repo_candidate.exists():
+        return repo_candidate
+
+    return cwd_candidate
+
 
 def get_dir_path() -> Path:
-    return Path(_get_text("agent/default_log_conf",
-                          "src/logcollector/config/conf.d"))
+    conf_dir = _resolve_path(_get_text("agent/default_log_conf", "src/logcollector/config/conf.d"))
+
+    if conf_dir.exists():
+        return conf_dir
+
+    bundled = Path(__file__).resolve().parent.parent / "config" / "conf.d"
+    if bundled.exists():
+        return bundled
+
+    return conf_dir
 
 
 def get_retry_interval() -> float:
-    return float(_get_text("agent/default_retry_interval", "30.0") or "30.0")
+    return _get_float("agent/default_retry_interval", 30.0)
 
 
 def get_scan_interval() -> float:
-    return float(_get_text("agent/default_scan_interval", "60.0") or "60.0")
+    return _get_float("agent/default_scan_interval", 60.0)
 
 
 class LogFormat(str, Enum):
@@ -172,8 +227,8 @@ def parse_multiline(
 def is_text(localfile_node: Optional[ET.Element]) -> Optional[str]:
 
     if localfile_node is not None and localfile_node.text:
-        return localfile_node.text
-    
+        return localfile_node.text.strip()
+
     return None
 
 # ------------------------------------------------------------------
