@@ -60,7 +60,7 @@ class DiskQueue:
                 if self._count >= self._limits.max_items:
                     raise QueueFullError
 
-            if self._limits.max_bytes is not None:
+            if self._limits.max_items is not None:
                 if self._total_bytes + len(payload) > self._limits.max_bytes:
                     raise QueueFullError
 
@@ -179,47 +179,16 @@ class DiskQueue:
                         size = path.stat().st_size
                         path.unlink()
                         self._total_bytes = max(0, self._total_bytes - size)
-                        self._count = max(0, self._count - 1)
                         removed += 1
                     except OSError as e:
                         logger.warning("can't delete queue item %s: %s", path, e)
 
+                self._count = max(0, self._count - 1)
                 self._head += 1
 
-            self._advance_head_over_missing()
             self._save_meta()
             
         return removed
-
-    def ack_exact(self, seqs) -> int:
-
-        removed = 0
-
-        with self._lock:
-            for seq in sorted({int(s) for s in seqs}):
-                path = self._item_path(seq)
-
-                if not path.exists():
-                    continue
-
-                try:
-                    size = path.stat().st_size
-                    path.unlink()
-                    self._total_bytes = max(0, self._total_bytes - size)
-                    self._count = max(0, self._count - 1)
-                    removed += 1
-                except OSError as e:
-                    logger.warning("can't delete queue item %s: %s", path, e)
-
-            self._advance_head_over_missing()
-            self._save_meta()
-
-        return removed
-
-    def _advance_head_over_missing(self) -> None:
-
-        while self._head < self._tail and not self._item_path(self._head).exists():
-            self._head += 1
         
     def size(self) -> int:
         with self._lock:

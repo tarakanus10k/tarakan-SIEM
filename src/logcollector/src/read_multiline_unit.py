@@ -39,13 +39,12 @@ class MultilineUnitReader(BaseReader):
     def flush(self) -> list[str]:
 
         out: list[str] = []
-
-        if self._buffer:
-            self._current.append(self._buffer.rstrip("\r"))
-            self._buffer = ""
-
         if self._current:
             out.append("\n".join(self._current))
             self._current = []
+
+        if self._buffer:
+            out.append(self._buffer.rstrip("\r"))
+            self._buffer = ""
 
         return out

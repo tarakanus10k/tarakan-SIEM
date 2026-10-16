@@ -1,5 +1,4 @@
 import os
-import stat
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional
@@ -8,58 +7,36 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 @lru_cache(maxsize=1)
 def _agent_conf_path() -> Path:
 
     return Path(__file__).resolve().parent.parent / "config" / "agent.conf"
 
+
 @lru_cache(maxsize=1)
-def _conf_root() -> "ET.Element | None":
-    try:
-        tree = ET.parse(_agent_conf_path())
-        return tree.getroot()
-    except (OSError, ET.ParseError) as e:
-        logger.error("не удалось прочитать agent.conf: %s", e)
-        return None
+def _conf_root() -> ET.Element:
+    tree = ET.parse(_agent_conf_path())
+    return tree.getroot()
+
 
 def _get_text(path: str, default: str = "") -> str:
-    root = _conf_root()
-    if root is None:
-        return default
-
     try:
-        v = root.findtext(path)
+        v = _conf_root().findtext(path)
+        return (v.strip() if v else default)
     except (OSError, ET.ParseError) as e:
         logger.error("не удалось прочитать agent.conf: %s", e)
         return default
 
-    return (v.strip() if v else default)
-
-def _resolve_path(raw: str) -> Path:
-
-    p = Path(raw)
-
-    if p.is_absolute():
-        return p
-
-    cwd_candidate = Path.cwd() / p
-    if cwd_candidate.exists():
-        return cwd_candidate
-
-    repo_candidate = _REPO_ROOT / p
-    if repo_candidate.exists():
-        return repo_candidate
-
-    return cwd_candidate
 
 def get_default_state_dir() -> Path:
-    return _resolve_path(_get_text("logcollector/default_state_dir", "/var/tsec/queue/logcollector"))
+    return Path(_get_text("logcollector/default_state_dir",
+                          "/var/tsec/queue/logcollector"))
 
 
 def get_ack_file() -> str:
     return _get_text("logcollector/default_ack_file", "pending_acks.json")
+
 
 def get_file_inode(path: str) -> Optional[int]:
     try:
@@ -68,10 +45,10 @@ def get_file_inode(path: str) -> Optional[int]:
         return None
 
 def find_rotated_file(
-        old_inode: int,
-        hint_dir: str,
+        old_inode: int, 
+        hint_dir: str, 
         hint_name: str
-        ) -> "str | None":
+        ) -> Optional[str]:
 
     try:
         entries = os.listdir(hint_dir)
@@ -79,9 +56,6 @@ def find_rotated_file(
         return None
 
     for entry in entries:
-        if entry == hint_name:
-            continue
-
         full = os.path.join(hint_dir, entry)
 
         try:
@@ -89,35 +63,8 @@ def find_rotated_file(
         except OSError:
             continue
 
-        if not stat.S_ISREG(st.st_mode):
-            continue
-
         if st.st_ino == old_inode:
             return full
-
-    return None
-
-def guess_rotated_file(hint_dir: str, hint_name: str) -> "str | None":
-
-    candidates = (
-        f"{hint_name}.1",
-        f"{hint_name}.1.gz",
-        f"{hint_name}.gz",
-        f"{hint_name}.old",
-    )
-
-    for name in candidates:
-        full = os.path.join(hint_dir, name)
-
-        try:
-            st = os.stat(full)
-        except OSError:
-            continue
-
-        if not stat.S_ISREG(st.st_mode):
-            continue
-
-        return full
 
     return None
 

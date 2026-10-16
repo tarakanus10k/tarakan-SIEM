@@ -38,6 +38,9 @@ from ..include.config import (
     source_key_from_obj,
 
     LogFormat, 
+    JournaldFilter, 
+    MultilineType, 
+    Multiline, 
     LocalFileRaw, 
     LocalFile
     )
@@ -131,14 +134,8 @@ class AgentLogConfig:
         current_mtimes: dict[str, float] = {}
 
         for conf_file in self.conf_dir_path.glob("*.conf"):
-            try:
-                if not conf_file.is_file():
-                    continue
-
+            if conf_file.is_file():
                 current_mtimes[str(conf_file)] = conf_file.stat().st_mtime
-            except OSError as e:
-                logger.warning("can't stat conf %s: %s", conf_file, e)
-                continue
 
         if current_mtimes == self._conf_mtimes:
             return
@@ -307,49 +304,37 @@ class AgentLogConfig:
 
     def _watch_loop(self) -> None:
 
-        watcher: Optional[_Watcher] = None
-
+        watcher: _Watcher
         if _HAS_INOTIFY:
-            try:
-                watcher = _InotifyWatcher(self.conf_dir_path, "*.conf", self._conf_changing)
-                watcher.start()
-            except OSError as e:
-                logger.warning("inotify недоступен (%s) — fallback на _ScanWatcher", e)
-                watcher = None
-            except Exception as e:
-                logger.warning("inotify watcher failed (%s) — fallback на _ScanWatcher", e)
-                watcher = None
-
-        if watcher is None:
+            inotify_watcher = _InotifyWatcher(self.conf_dir_path, "*.conf", self._conf_changing)
+            watcher = inotify_watcher
+        else:
             logger.info("inotify недоступен, fallback на _ScanWatcher (периодическое сканирование)")
-            watcher = _ScanWatcher(self.conf_dir_path, "*.conf", self._conf_changing, scan_interval=float(self.conf_scan_interval))
-            watcher.start()
+            watcher = _ScanWatcher(self.conf_dir_path, "*.conf", self._conf_changing,
+                                   scan_interval=float(self.conf_scan_interval))
+
+        watcher.start()
 
         try:
 
             while not self._stop_event.is_set():
                 self._stop_event.wait(self.conf_scan_interval)
 
-                try:
-                    with self._lock:
-                        self._load_conf_dir()
-                        self._validate_unvalid_confs()
-                except Exception as e:
-                    logger.warning("config reload iteration failed: %s", e)
+                with self._lock:
+                    self._load_conf_dir()
+                    self._validate_unvalid_confs()
         finally:
             watcher.stop()
         
+
     def _retry_loop(self) -> None:
 
         while not self._stop_event.wait(self.conf_retry_interval):
-            try:
-                with self._lock:
-                    if not self._unvalid_confs:
-                        continue
+            with self._lock:
+                if not self._unvalid_confs:
+                    continue
 
-                    self._validate_unvalid_confs()
-            except Exception as e:
-                logger.warning("config retry iteration failed: %s", e)
+                self._validate_unvalid_confs()
 
     def _conf_changing(self, fpath: str) -> None:
         with self._lock:
@@ -416,10 +401,7 @@ class _InotifyWatcher(_Watcher):
             if not fnmatch.fnmatch(fname, self.pattern):
                 continue
 
-            try:
-                self.callback(os.path.join(path, fname))
-            except Exception as e:
-                logger.warning("conf-changed callback failed for %s: %s", fname, e)
+            self.callback(os.path.join(path, fname))
 
     def stop(self) -> None:
 
@@ -432,6 +414,11 @@ class _InotifyWatcher(_Watcher):
 
 
 class _ScanWatcher(_Watcher):
+    """Fallback: периодическое сканирование mtime .conf-файлов.
+
+    Используется, когда модуль `inotify` недоступен (например, на файловых
+    системах без inotify или в среде без установленного пакета).
+    """
 
     def __init__(
             self,
